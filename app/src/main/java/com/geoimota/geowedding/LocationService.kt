@@ -14,6 +14,14 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.IOException
+import android.os.Handler
+import android.os.Looper
+import java.time.LocalDateTime
+import java.time.ZoneId
+import android.os.SystemClock
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import java.time.Instant
 
 class LocationService : Service() {
     companion object {
@@ -30,10 +38,80 @@ class LocationService : Service() {
     private lateinit var fused: FusedLocationProviderClient
     private val http = OkHttpClient()
     private var role = "groom"
+    private val handler = Handler(Looper.getMainLooper())
+    private var lastLocation: Location? = null
+    private var running = false
+    private val offlinePrefs by lazy { getSharedPreferences("pending_gps", MODE_PRIVATE) }
+    private var lastSentFixMs = 0L
+    @Volatile private var requestInFlight = false
+    // Ažuriraj i pohrani posljednju stvarnu GPS lokaciju, čak i bez interneta.
+    // Ne šalji staro očitanje s novim vremenskim žigom.
+    private val tick = object : Runnable {
+        override fun run() {
+            if (!running) return
+            if (afterEnd()) { stopTracking(); return }
+            if (withinEvent()) {
+                lastLocation?.let { loc ->
+                    val ageMs = (SystemClock.elapsedRealtimeNanos() - loc.elapsedRealtimeNanos) / 1_000_000L
+                    if (ageMs in 0..120_000L) savePending(loc)
+                }
+                flushPending()
+            }
+            handler.postDelayed(this, 5000L)
+        }
+    }
+
+    private fun fixTimestamp(loc: Location): Long {
+        // Timestamp stvarnog očitanja; ograniči neispravan sat uređaja.
+        val now = System.currentTimeMillis()
+        return if (loc.time in (now - 24L * 60 * 60 * 1000)..(now + 5000L)) loc.time else 0L
+    }
+
+    private fun savePending(loc: Location) {
+        val time = fixTimestamp(loc)
+        if (time <= 0L) return
+        val old = offlinePrefs.getLong("time", 0L)
+        if (time <= old || time <= lastSentFixMs) return
+        offlinePrefs.edit()
+            .putLong("time", time)
+            .putString("lat", loc.latitude.toString())
+            .putString("lng", loc.longitude.toString())
+            .putString("accuracy", loc.accuracy.toString())
+            .apply()
+    }
+
+    private fun isConnected(): Boolean {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return false
+        val network = cm.activeNetwork ?: return false
+        val capabilities = cm.getNetworkCapabilities(network) ?: return false
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    private fun flushPending() {
+        if (requestInFlight || !isConnected() || !withinEvent()) return
+        val time = offlinePrefs.getLong("time", 0L)
+        if (time <= lastSentFixMs) return
+        val lat = offlinePrefs.getString("lat", null)?.toDoubleOrNull() ?: return
+        val lng = offlinePrefs.getString("lng", null)?.toDoubleOrNull() ?: return
+        val accuracy = offlinePrefs.getString("accuracy", null)?.toDoubleOrNull() ?: return
+        if (!lat.isFinite() || !lng.isFinite() || lat !in -90.0..90.0 || lng !in -180.0..180.0) return
+        sendPending(lat, lng, accuracy, time)
+    }
+
+    private fun eventStart(): Long = LocalDateTime.of(2029, 9, 29, 11, 0)
+        .atZone(ZoneId.of("Europe/Sarajevo")).toInstant().toEpochMilli()
+    private fun eventEnd(): Long = LocalDateTime.of(2029, 9, 30, 6, 0)
+        .atZone(ZoneId.of("Europe/Sarajevo")).toInstant().toEpochMilli()
+    private fun withinEvent(): Boolean = System.currentTimeMillis() in eventStart() until eventEnd()
+    private fun afterEnd(): Boolean = System.currentTimeMillis() >= eventEnd()
+
 
     private val callback = object : LocationCallback() {
         override fun onLocationResult(result: LocationResult) {
-            result.lastLocation?.let { sendLocation(it) }
+            result.lastLocation?.let { loc ->
+                lastLocation = loc
+                if (withinEvent()) { savePending(loc); flushPending() }
+            }
         }
     }
 
@@ -44,14 +122,17 @@ class LocationService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (afterEnd()) { stopTracking(); return START_NOT_STICKY }
         when(intent?.action) {
             ACTION_STOP -> {
                 stopTracking()
                 return START_NOT_STICKY
             }
             ACTION_START -> {
-                role = intent.getStringExtra(EXTRA_ROLE)
+                val newRole = intent.getStringExtra(EXTRA_ROLE)
                     ?: getSharedPreferences("tracker", MODE_PRIVATE).getString("role", "groom")!!
+                if (role != newRole) offlinePrefs.edit().clear().apply()
+                role = newRole
                 getSharedPreferences("tracker", MODE_PRIVATE).edit()
                     .putBoolean("tracking", true).putString("role", role).apply()
                 startForeground(NOTIFICATION_ID, notification())
@@ -100,22 +181,28 @@ class LocationService : Service() {
         }
         val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 5000L)
             .setMinUpdateIntervalMillis(3000L)
-            .setMinUpdateDistanceMeters(5f)
+            .setMinUpdateDistanceMeters(0f)
+            .setMaxUpdateDelayMillis(5000L)
             .build()
         fused.removeLocationUpdates(callback)
         fused.requestLocationUpdates(request, callback, mainLooper)
+        // Početna lokacija dok čekamo prvo aktivno očitanje.
+        fused.lastLocation.addOnSuccessListener { loc -> if (loc != null && lastLocation == null) lastLocation = loc }
+        running = true
+        handler.removeCallbacks(tick)
+        handler.post(tick)
     }
 
-    private fun sendLocation(loc: Location) {
-        val id = if(role == "groom") 1 else 2
+    private fun sendPending(lat: Double, lng: Double, accuracy: Double, fixTime: Long) {
+        if (requestInFlight) return
+        requestInFlight = true
+        val id = if (role == "groom") 1 else 2
         val json = JSONObject().apply {
             put("id", id)
-            put("lat", loc.latitude)
-            put("lng", loc.longitude)
-            put("accuracy", loc.accuracy.toDouble())
-            if (loc.hasSpeed()) put("speed", loc.speed.toDouble())
-            if (loc.hasBearing()) put("heading", loc.bearing.toDouble())
-            put("updated_at", java.time.Instant.now().toString())
+            put("lat", lat)
+            put("lng", lng)
+            put("accuracy", accuracy)
+            put("updated_at", Instant.ofEpochMilli(fixTime).toString())
         }
         val body = json.toString().toRequestBody("application/json".toMediaType())
         val request = Request.Builder()
@@ -125,16 +212,34 @@ class LocationService : Service() {
             .header("Prefer", "resolution=merge-duplicates,return=minimal")
             .post(body)
             .build()
-        http.newCall(request).enqueue(object: Callback {
-            override fun onFailure(call: Call, e: IOException) {}
-            override fun onResponse(call: Call, response: Response) { response.close() }
+        http.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                requestInFlight = false // zadrži posljednji fix za idući pokušaj
+            }
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    if (it.isSuccessful) {
+                        lastSentFixMs = maxOf(lastSentFixMs, fixTime)
+                        // Ne briši novije očitanje koje je stiglo tijekom zahtjeva.
+                        if (offlinePrefs.getLong("time", 0L) <= fixTime) {
+                            offlinePrefs.edit().clear().apply()
+                        }
+                    } else {
+                        android.util.Log.w("GeoWeddingTracker", "Supabase HTTP ${it.code}")
+                    }
+                }
+                requestInFlight = false
+            }
         })
     }
 
     private fun stopTracking() {
+        running = false
+        handler.removeCallbacks(tick)
         fused.removeLocationUpdates(callback)
         getSharedPreferences("tracker", MODE_PRIVATE).edit()
             .putBoolean("tracking", false).apply()
+        // Zadnje ocitanje ostaje na uredaju; nakon završetka ne šalji ga izvan rasporeda.
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -147,6 +252,8 @@ class LocationService : Service() {
     }
 
     override fun onDestroy() {
+        running = false
+        handler.removeCallbacks(tick)
         fused.removeLocationUpdates(callback)
         super.onDestroy()
     }
