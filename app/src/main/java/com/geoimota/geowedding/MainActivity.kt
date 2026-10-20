@@ -66,10 +66,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         stopButton.setOnClickListener {
-            val stopIntent = Intent(this, LocationService::class.java).apply {
+            startService(Intent(this, LocationService::class.java).apply {
                 action = LocationService.ACTION_STOP
-            }
-            startService(stopIntent)
+            })
             getSharedPreferences("tracker", MODE_PRIVATE).edit()
                 .putBoolean("tracking", false).apply()
             setUi(false, null)
@@ -143,11 +142,9 @@ class MainActivity : AppCompatActivity() {
         startButton.visibility = if(on) View.GONE else View.VISIBLE
         stopButton.visibility = if(on) View.VISIBLE else View.GONE
         pinInput.isEnabled = !on
-        statusText.text = if (on) {
-            val who = if (role == "groom") "Mladoženja" else "Mlada"
-            "Praćenje je aktivno: $who. Možeš zaključati zaslon ili prijeći u drugu aplikaciju."
-        } else {
-            "Praćenje nije aktivno."
-        }
+        statusText.text = if(on)
+            "Praćenje je aktivno: " + (if(role == "groom") "Mladoženja" else "Mlada") +
+            ". Možeš zaključati zaslon ili prijeći u drugu aplikaciju."
+        else "Praćenje nije aktivno."
     }
 }
